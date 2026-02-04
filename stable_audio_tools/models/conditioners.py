@@ -703,7 +703,13 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
             if conditioner_config.get("pretransform_ckpt_path", None) is not None:
                 pretransform.load_state_dict(load_ckpt_state_dict(conditioner_config.pop("pretransform_ckpt_path")))
 
-            conditioners[id] = AudioAutoencoderConditioner(pretransform, **conditioner_config)            
+            conditioners[id] = AudioAutoencoderConditioner(pretransform, **conditioner_config)
+        elif conditioner_type == "trajectory":
+            from ..robotics.trajectory_conditioner import TrajectoryConditioner
+            conditioners[id] = TrajectoryConditioner(**conditioner_config)
+        elif conditioner_type == "trajectory_history":
+            from ..robotics.trajectory_conditioner import TrajectoryHistoryConditioner
+            conditioners[id] = TrajectoryHistoryConditioner(**conditioner_config)
         else:
             raise ValueError(f"Unknown conditioner type: {conditioner_type}")
 

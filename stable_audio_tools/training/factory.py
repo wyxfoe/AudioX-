@@ -153,6 +153,18 @@ def create_training_wrapper_from_config(model_config, model):
             pre_encoded=training_config.get("pre_encoded", False),
         )
 
+    elif model_type == 'robot_diffusion':
+        from ..robotics.robot_training import RobotDiffusionTrainingWrapper
+        return RobotDiffusionTrainingWrapper(
+            model,
+            lr=training_config.get("learning_rate", None),
+            use_ema=training_config.get("use_ema", True),
+            log_loss_info=training_config.get("log_loss_info", True),
+            cfg_dropout_prob=training_config.get("cfg_dropout_prob", 0.1),
+            timestep_sampler=training_config.get("timestep_sampler", "uniform"),
+            optimizer_configs=training_config.get("optimizer_configs", None),
+            action_loss_weights=training_config.get("action_loss_weights", None),
+        )
     else:
         raise NotImplementedError(f'Unknown model type: {model_type}')
 
@@ -235,6 +247,14 @@ def create_demo_callback_from_config(model_config, **kwargs):
             demo_conditioning=demo_config.get("demo_cond", None),
             num_demos=demo_config.get("num_demos", 8),
             **kwargs
+        )
+    elif model_type == "robot_diffusion":
+        from ..robotics.robot_training import RobotDemoCallback
+        return RobotDemoCallback(
+            demo_every=demo_config.get("demo_every", 5000),
+            num_demos=demo_config.get("num_demos", 4),
+            demo_steps=demo_config.get("demo_steps", 50),
+            demo_cfg_scales=demo_config.get("demo_cfg_scales", [1.0, 3.0]),
         )
     else:
         raise NotImplementedError(f'Unknown model type: {model_type}')

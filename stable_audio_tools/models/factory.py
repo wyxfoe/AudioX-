@@ -20,6 +20,9 @@ def create_model_from_config(model_config):
     elif model_type == 'lm':
         from .lm import create_audio_lm_from_config
         return create_audio_lm_from_config(model_config)
+    elif model_type == 'robot_diffusion':
+        from ..robotics.robot_model import create_robot_model_from_config
+        return create_robot_model_from_config(model_config)
     else:
         raise NotImplementedError(f'Unknown model type: {model_type}')
 
