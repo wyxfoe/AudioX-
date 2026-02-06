@@ -51,11 +51,7 @@
                     "type": "trajectory",
                     "config": {
                         "state_dim": 16,
-                        "num_tokens": 16,
-                        "hidden_dim": 512,
-                        "num_layers": 3,
-                        "include_velocity": false,
-                        "history_length": 1
+                        "mode": "direct"
                     }
                 }
             ]
