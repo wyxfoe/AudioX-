@@ -768,8 +768,25 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             force_channels=force_channels,
             epoch_steps=dataset_config.get("epoch_steps", 2000)
         ).data_loader
-        
 
+    elif dataset_type == "robotwin":
+        # RoboTwin HDF5 dataset for robot trajectory prediction
+        from ..robotics.robotwin_dataset import create_robotwin_dataloader
+
+        dataloader, _ = create_robotwin_dataloader(
+            data_dir=dataset_config.get("data_dir"),
+            batch_size=batch_size,
+            action_chunk_size=dataset_config.get("action_chunk_size", 50),
+            image_size=dataset_config.get("image_size", 224),
+            camera_names=dataset_config.get("camera_names", ["front_camera", "head_camera"]),
+            task_description=dataset_config.get("task_description", "complete the task"),
+            num_workers=num_workers,
+            max_episodes=dataset_config.get("max_episodes", None),
+            normalize=dataset_config.get("normalize", True),
+            augment=dataset_config.get("augment", True),
+            shuffle=True,
+        )
+        return dataloader
 
 
 def create_dataloader_from_config_valid(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4):
