@@ -1,31 +1,23 @@
 """
 RoboTwin Dataset Loader for RobotX.
 
-Loads trajectory data from RoboTwin simulation benchmark for fine-tuning.
-RoboTwin provides dual-arm manipulation demonstrations with:
-  - Joint angle trajectories (proprioception + action)
-  - Multi-view camera images
-  - Language instructions
-
-Data format (per episode):
-  - observations/joint_positions: (T, num_joints) current joint angles
-  - actions: (T, num_joints) target joint angles
-  - observations/images/{camera_name}: (T, H, W, 3) RGB images
-  - language_instruction: str
-
-This loader converts the data into the format expected by the RobotX
-training pipeline, including action chunking and normalization.
+Supports RoboTwin HDF5 format with the following structure:
+  - joint_action/vector: (T, action_dim) combined joint actions
+  - joint_action/left_arm: (T, 6) left arm joints
+  - joint_action/right_arm: (T, 6) right arm joints
+  - joint_action/left_gripper: (T,) left gripper
+  - joint_action/right_gripper: (T,) right gripper
+  - observation/{camera_name}/rgb: (T,) encoded RGB images
 """
 
 import os
-import json
+import io
 import glob
 import random
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple
 from PIL import Image
 from torchvision import transforms
 
@@ -34,62 +26,60 @@ from .action_space import (
     normalize_actions,
     denormalize_actions,
     compute_action_stats,
-    ROBOTWIN_CONFIGS,
 )
 
 
-class RoboTwinDataset(Dataset):
-    """
-    Dataset for loading RoboTwin trajectory data.
+# Aloha-AgileX 配置: 每臂6 DoF + 1 gripper = 14维
+ALOHA_AGILEX_CONFIG = ActionSpaceConfig(
+    left_arm_dim=6,
+    right_arm_dim=6,
+    left_gripper_dim=1,
+    right_gripper_dim=1,
+    use_ee_pose=False,
+)
 
-    Supports multiple data formats:
-      1. HDF5/zarr format (standard RoboTwin output)
-      2. NPZ format (preprocessed)
-      3. Directory-based format with JSON metadata
+
+class RoboTwinHDF5Dataset(Dataset):
+    """
+    Dataset for loading RoboTwin HDF5 trajectory data.
+
+    Specifically designed for the Aloha-AgileX format with:
+      - joint_action/vector as combined action
+      - observation/{camera}/rgb as encoded images
 
     Args:
-        data_dir: root directory containing episode data
-        action_config: ActionSpaceConfig defining the action space
-        action_chunk_size: number of future actions per sample
+        data_dir: directory containing episode HDF5 files
+        action_chunk_size: number of future actions per sample (default 64)
         image_size: resize images to (image_size, image_size)
         camera_names: list of camera views to use
-        max_episodes: maximum number of episodes to load (None = all)
-        task_name: specific task to filter for (None = all tasks)
-        embodiment: robot embodiment name (e.g., 'franka_dual')
+        max_episodes: maximum number of episodes to load
+        task_description: language instruction for this task
         normalize: whether to normalize actions
-        action_stats: precomputed action statistics for normalization
         augment: whether to apply data augmentation
-        language_instructions: list of language instructions per episode
     """
 
     def __init__(
         self,
         data_dir: str,
-        action_config: ActionSpaceConfig = None,
         action_chunk_size: int = 64,
         image_size: int = 224,
         camera_names: List[str] = None,
         max_episodes: Optional[int] = None,
-        task_name: Optional[str] = None,
-        embodiment: str = "franka_dual",
+        task_description: str = "complete the manipulation task",
         normalize: bool = True,
-        action_stats: Optional[Dict[str, torch.Tensor]] = None,
         augment: bool = True,
     ):
         super().__init__()
 
-        if action_config is None:
-            action_config = ROBOTWIN_CONFIGS.get(embodiment, ActionSpaceConfig())
-
-        self.action_config = action_config
         self.action_chunk_size = action_chunk_size
         self.image_size = image_size
-        self.camera_names = camera_names or ["front", "left_wrist", "right_wrist"]
+        self.camera_names = camera_names or ["front_camera", "head_camera"]
+        self.task_description = task_description
         self.normalize = normalize
         self.augment = augment
-        self.embodiment = embodiment
+        self.action_dim = 14  # Aloha-AgileX: 6+1+6+1=14
 
-        # Image transforms (CLIP-compatible preprocessing)
+        # Image transforms (CLIP-compatible)
         clip_mean = [0.48145466, 0.4578275, 0.40821073]
         clip_std = [0.26862954, 0.26130258, 0.27577711]
 
@@ -100,196 +90,123 @@ class RoboTwinDataset(Dataset):
         ])
 
         self.augment_transform = transforms.Compose([
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-            transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
         ]) if augment else None
 
-        # Load episodes
-        self.episodes = self._load_episodes(data_dir, task_name, max_episodes)
+        # Find all HDF5 files
+        self.hdf5_files = self._find_hdf5_files(data_dir, max_episodes)
+        print(f"Found {len(self.hdf5_files)} HDF5 episode files")
 
-        # Build index: (episode_idx, timestep) for each valid sample
+        # Load all episodes into memory (for small datasets like 500 episodes)
+        self.episodes = []
+        self._load_all_episodes()
+
+        # Build sample index
         self.samples = self._build_sample_index()
+        print(f"Total samples: {len(self.samples)}")
 
-        # Compute or load action statistics
-        if self.normalize:
-            if action_stats is not None:
-                self.action_stats = action_stats
-            else:
-                self.action_stats = self._compute_stats()
+        # Compute action statistics
+        if self.normalize and len(self.episodes) > 0:
+            self.action_stats = self._compute_stats()
+            print(f"Action stats - mean: {self.action_stats['mean'][:4]}..., "
+                  f"std: {self.action_stats['std'][:4]}...")
+        else:
+            self.action_stats = None
 
-        print(f"RoboTwinDataset: {len(self.episodes)} episodes, "
-              f"{len(self.samples)} samples, "
-              f"action_dim={action_config.total_action_dim}, "
-              f"chunk_size={action_chunk_size}")
+    def _find_hdf5_files(self, data_dir: str, max_episodes: Optional[int]) -> List[str]:
+        """Find all HDF5 files in the data directory."""
+        # Try multiple patterns
+        patterns = [
+            os.path.join(data_dir, "*.hdf5"),
+            os.path.join(data_dir, "**", "*.hdf5"),
+            os.path.join(data_dir, "data", "*.hdf5"),
+        ]
 
-    def _load_episodes(
-        self, data_dir: str, task_name: Optional[str], max_episodes: Optional[int]
-    ) -> List[Dict]:
-        """Load episode data from directory structure."""
-        episodes = []
+        files = []
+        for pattern in patterns:
+            files.extend(glob.glob(pattern, recursive=True))
 
-        # Try loading from different formats
-        # Format 1: NPZ files
-        npz_pattern = os.path.join(data_dir, "**", "*.npz")
-        npz_files = sorted(glob.glob(npz_pattern, recursive=True))
+        files = sorted(list(set(files)))  # Remove duplicates and sort
 
-        if npz_files:
-            for npz_file in npz_files:
-                if task_name and task_name not in npz_file:
-                    continue
-                try:
-                    data = np.load(npz_file, allow_pickle=True)
-                    episode = {
-                        "actions": torch.from_numpy(data["actions"]).float(),
-                        "states": torch.from_numpy(data["joint_positions"]).float()
-                            if "joint_positions" in data
-                            else torch.from_numpy(data["states"]).float(),
-                        "file_path": npz_file,
-                    }
+        if max_episodes and len(files) > max_episodes:
+            files = files[:max_episodes]
 
-                    # Load images if available
-                    for cam in self.camera_names:
-                        key = f"images_{cam}"
-                        if key in data:
-                            episode[key] = data[key]  # Keep as numpy, load on demand
+        return files
 
-                    # Load language instruction
-                    if "language_instruction" in data:
-                        episode["language"] = str(data["language_instruction"])
-                    else:
-                        # Infer from directory name
-                        task_dir = os.path.basename(os.path.dirname(npz_file))
-                        episode["language"] = task_dir.replace("_", " ")
+    def _load_all_episodes(self):
+        """Load all episodes into memory."""
+        import h5py
 
-                    episodes.append(episode)
-                except Exception as e:
-                    print(f"Error loading {npz_file}: {e}")
-                    continue
-
-                if max_episodes and len(episodes) >= max_episodes:
-                    break
-
-        # Format 2: JSON metadata + binary files
-        if not episodes:
-            json_pattern = os.path.join(data_dir, "**", "metadata.json")
-            json_files = sorted(glob.glob(json_pattern, recursive=True))
-
-            for json_file in json_files:
-                if task_name and task_name not in json_file:
-                    continue
-                try:
-                    with open(json_file, "r") as f:
-                        metadata = json.load(f)
-
-                    ep_dir = os.path.dirname(json_file)
-
-                    # Load trajectory data
-                    actions_path = os.path.join(ep_dir, "actions.npy")
-                    states_path = os.path.join(ep_dir, "states.npy")
-
-                    if os.path.exists(actions_path) and os.path.exists(states_path):
-                        episode = {
-                            "actions": torch.from_numpy(np.load(actions_path)).float(),
-                            "states": torch.from_numpy(np.load(states_path)).float(),
-                            "language": metadata.get("language_instruction", ""),
-                            "file_path": json_file,
-                        }
-
-                        # Store image directory for lazy loading
-                        for cam in self.camera_names:
-                            cam_dir = os.path.join(ep_dir, "images", cam)
-                            if os.path.exists(cam_dir):
-                                episode[f"image_dir_{cam}"] = cam_dir
-
-                        episodes.append(episode)
-                except Exception as e:
-                    print(f"Error loading {json_file}: {e}")
-                    continue
-
-                if max_episodes and len(episodes) >= max_episodes:
-                    break
-
-        # Format 3: HDF5 files
-        if not episodes:
+        for hdf5_path in self.hdf5_files:
             try:
-                import h5py
-                hdf5_pattern = os.path.join(data_dir, "**", "*.hdf5")
-                hdf5_files = sorted(glob.glob(hdf5_pattern, recursive=True))
+                with h5py.File(hdf5_path, 'r') as f:
+                    # Load actions - use vector if available, else concatenate
+                    if 'joint_action/vector' in f:
+                        actions = f['joint_action/vector'][:]
+                    else:
+                        # Concatenate individual components
+                        left_arm = f['joint_action/left_arm'][:]
+                        left_grip = f['joint_action/left_gripper'][:].reshape(-1, 1)
+                        right_arm = f['joint_action/right_arm'][:]
+                        right_grip = f['joint_action/right_gripper'][:].reshape(-1, 1)
+                        actions = np.concatenate([left_arm, left_grip, right_arm, right_grip], axis=1)
 
-                for hdf5_file in hdf5_files:
-                    if task_name and task_name not in hdf5_file:
-                        continue
-                    try:
-                        with h5py.File(hdf5_file, "r") as f:
-                            episode = {
-                                "actions": torch.from_numpy(f["actions"][()]).float(),
-                                "states": torch.from_numpy(
-                                    f["observations/joint_positions"][()]
-                                ).float(),
-                                "file_path": hdf5_file,
-                            }
-                            if "language_instruction" in f.attrs:
-                                episode["language"] = f.attrs["language_instruction"]
-                            else:
-                                task_dir = os.path.basename(os.path.dirname(hdf5_file))
-                                episode["language"] = task_dir.replace("_", " ")
+                    # Actions are also the states (current joint positions)
+                    states = actions.copy()
 
-                            for cam in self.camera_names:
-                                key = f"observations/images/{cam}"
-                                if key in f:
-                                    episode[f"images_{cam}"] = f[key][()]
+                    # Load images for each camera
+                    images = {}
+                    for cam in self.camera_names:
+                        cam_key = f'observation/{cam}/rgb'
+                        if cam_key in f:
+                            # Images are stored as encoded byte strings
+                            images[cam] = f[cam_key][:]
 
-                        episodes.append(episode)
-                    except Exception as e:
-                        print(f"Error loading {hdf5_file}: {e}")
-                        continue
+                    episode = {
+                        'actions': torch.from_numpy(actions).float(),
+                        'states': torch.from_numpy(states).float(),
+                        'images': images,
+                        'file_path': hdf5_path,
+                        'length': actions.shape[0],
+                    }
+                    self.episodes.append(episode)
 
-                    if max_episodes and len(episodes) >= max_episodes:
-                        break
-            except ImportError:
-                pass
+            except Exception as e:
+                print(f"Error loading {hdf5_path}: {e}")
+                continue
 
-        return episodes
+        print(f"Loaded {len(self.episodes)} episodes successfully")
 
     def _build_sample_index(self) -> List[Tuple[int, int]]:
         """Build (episode_idx, timestep) index for valid samples."""
         samples = []
         for ep_idx, episode in enumerate(self.episodes):
-            T = episode["actions"].shape[0]
+            T = episode['length']
             # Each timestep where we can extract a full action chunk
-            for t in range(T - self.action_chunk_size + 1):
+            for t in range(max(0, T - self.action_chunk_size + 1)):
                 samples.append((ep_idx, t))
         return samples
 
     def _compute_stats(self) -> Dict[str, torch.Tensor]:
-        """Compute action normalization statistics across the dataset."""
-        all_actions = torch.cat([ep["actions"] for ep in self.episodes], dim=0)
+        """Compute action normalization statistics."""
+        all_actions = torch.cat([ep['actions'] for ep in self.episodes], dim=0)
         return compute_action_stats(all_actions)
 
-    def _load_image(self, episode: Dict, cam: str, timestep: int) -> Optional[torch.Tensor]:
-        """Load and preprocess a camera image."""
-        # Try numpy array first
-        key = f"images_{cam}"
-        if key in episode:
-            img_np = episode[key][timestep]
-            img = Image.fromarray(img_np.astype(np.uint8))
-            if self.augment and self.augment_transform is not None:
-                img = self.augment_transform(img)
-            return self.image_transform(img)
+    def _decode_image(self, encoded_bytes) -> Image.Image:
+        """Decode image from byte string."""
+        if isinstance(encoded_bytes, bytes):
+            img_bytes = encoded_bytes
+        elif isinstance(encoded_bytes, np.ndarray):
+            img_bytes = encoded_bytes.tobytes()
+        else:
+            img_bytes = bytes(encoded_bytes)
 
-        # Try directory-based loading
-        dir_key = f"image_dir_{cam}"
-        if dir_key in episode:
-            img_path = os.path.join(episode[dir_key], f"{timestep:06d}.png")
-            if not os.path.exists(img_path):
-                img_path = os.path.join(episode[dir_key], f"{timestep:06d}.jpg")
-            if os.path.exists(img_path):
-                img = Image.open(img_path).convert("RGB")
-                if self.augment and self.augment_transform is not None:
-                    img = self.augment_transform(img)
-                return self.image_transform(img)
-
-        return None
+        try:
+            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            return img
+        except Exception as e:
+            # Return a blank image if decoding fails
+            return Image.new('RGB', (self.image_size, self.image_size), color=(128, 128, 128))
 
     def __len__(self):
         return len(self.samples)
@@ -298,45 +215,54 @@ class RoboTwinDataset(Dataset):
         ep_idx, timestep = self.samples[idx]
         episode = self.episodes[ep_idx]
 
-        # Get action chunk: (chunk_size, action_dim)
-        actions = episode["actions"][timestep: timestep + self.action_chunk_size]
+        # Get action chunk
+        end_t = min(timestep + self.action_chunk_size, episode['length'])
+        actions = episode['actions'][timestep:end_t].clone()
 
-        # Get current proprioceptive state
-        state = episode["states"][timestep]  # (state_dim,)
+        # Pad if needed
+        if actions.shape[0] < self.action_chunk_size:
+            pad_size = self.action_chunk_size - actions.shape[0]
+            # Repeat last action for padding
+            last_action = actions[-1:].repeat(pad_size, 1)
+            actions = torch.cat([actions, last_action], dim=0)
+
+        # Get current state (proprioception)
+        state = episode['states'][timestep].clone()
 
         # Normalize actions
-        if self.normalize:
+        if self.normalize and self.action_stats is not None:
             actions = normalize_actions(actions.unsqueeze(0), self.action_stats).squeeze(0)
 
-        # Reshape actions for diffusion: (action_dim, chunk_size)
-        # This matches AudioX's (channels, sequence_length) format
-        actions = actions.permute(1, 0)  # (action_dim, chunk_size)
+        # Reshape for diffusion: (action_dim, chunk_size)
+        actions = actions.permute(1, 0)  # (14, 64)
 
-        # Load images for the current timestep
+        # Load and process images
         video_frames = []
         for cam in self.camera_names:
-            img = self._load_image(episode, cam, timestep)
-            if img is not None:
-                video_frames.append(img)
+            if cam in episode['images'] and timestep < len(episode['images'][cam]):
+                encoded = episode['images'][cam][timestep]
+                img = self._decode_image(encoded)
 
-        # Stack camera views into video tensor
-        # Shape: (num_cameras, C, H, W) - treated as temporal frames for CLIP
+                if self.augment and self.augment_transform is not None:
+                    img = self.augment_transform(img)
+
+                img_tensor = self.image_transform(img)
+                video_frames.append(img_tensor)
+
+        # Stack camera views
         if video_frames:
-            video_tensor = torch.stack(video_frames, dim=0)  # (num_cams, 3, H, W)
+            video_tensor = torch.stack(video_frames, dim=0)
         else:
-            # Empty video placeholder
-            video_tensor = torch.zeros(
-                len(self.camera_names), 3, self.image_size, self.image_size
-            )
+            video_tensor = torch.zeros(len(self.camera_names), 3, self.image_size, self.image_size)
 
-        # Metadata dictionary (following AudioX's metadata format)
+        # Metadata
         info = {
-            "prompt": episode.get("language", ""),
-            "proprio": state,
-            "video": video_tensor,
-            "padding_mask": torch.ones(self.action_chunk_size),
-            "episode_idx": ep_idx,
-            "timestep": timestep,
+            'prompt': self.task_description,
+            'proprio': state,
+            'video': video_tensor,
+            'padding_mask': torch.ones(self.action_chunk_size),
+            'episode_idx': ep_idx,
+            'timestep': timestep,
         }
 
         return actions, info
@@ -355,37 +281,52 @@ def create_robotwin_dataloader(
     action_chunk_size: int = 64,
     image_size: int = 224,
     camera_names: List[str] = None,
-    embodiment: str = "franka_dual",
+    task_description: str = "complete the manipulation task",
     num_workers: int = 4,
     max_episodes: Optional[int] = None,
-    task_name: Optional[str] = None,
     normalize: bool = True,
     action_stats: Optional[Dict] = None,
     shuffle: bool = True,
     augment: bool = True,
-) -> Tuple[DataLoader, RoboTwinDataset]:
+    **kwargs,
+) -> Tuple[DataLoader, RoboTwinHDF5Dataset]:
     """
-    Create a DataLoader for RoboTwin data.
+    Create a DataLoader for RoboTwin HDF5 data.
+
+    Args:
+        data_dir: path to directory containing HDF5 files
+        batch_size: batch size
+        action_chunk_size: number of future actions to predict
+        image_size: image resize dimension
+        camera_names: list of camera names (e.g., ["front_camera", "head_camera"])
+        task_description: language instruction
+        num_workers: dataloader workers
+        max_episodes: limit number of episodes
+        normalize: normalize actions
+        action_stats: precomputed stats (if None, computed from data)
+        shuffle: shuffle data
+        augment: apply augmentation
 
     Returns:
-        dataloader: PyTorch DataLoader
-        dataset: the dataset instance (for accessing action_stats etc.)
+        dataloader, dataset
     """
-    config = ROBOTWIN_CONFIGS.get(embodiment, ActionSpaceConfig())
+    if camera_names is None:
+        camera_names = ["front_camera", "head_camera"]
 
-    dataset = RoboTwinDataset(
+    dataset = RoboTwinHDF5Dataset(
         data_dir=data_dir,
-        action_config=config,
         action_chunk_size=action_chunk_size,
         image_size=image_size,
         camera_names=camera_names,
         max_episodes=max_episodes,
-        task_name=task_name,
-        embodiment=embodiment,
+        task_description=task_description,
         normalize=normalize,
-        action_stats=action_stats,
         augment=augment,
     )
+
+    # Use provided action_stats if given
+    if action_stats is not None:
+        dataset.action_stats = action_stats
 
     dataloader = DataLoader(
         dataset,
