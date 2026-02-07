@@ -6,11 +6,12 @@ ckpt_setting: null
 seed: null
 instruction_type: unseen
 
-# AudioX-specific parameters
-config_path: null
+# AudioX model configuration
 ckpt_path: null
+config_path: null
 action_stats_path: null
-checkpoint_num: latest
-audiox_chunk_size: 64
+
+# AudioX inference parameters
+audiox_chunk_size: 50
 cfg_scale: 3.0
 num_steps: 50

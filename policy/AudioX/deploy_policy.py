@@ -77,32 +77,24 @@ def get_model(usr_args):
     policy_dir = parent_directory
     project_root_path = str(Path(policy_dir).parent.parent)
 
-    config_path = usr_args.get(
-        "config_path",
-        os.path.join(project_root_path, "configs", "robotx_robotwin.json"),
+    # Default config: robotx_aloha_agilex.json (14-dim, chunk_size=50)
+    config_path = usr_args.get("config_path") or os.path.join(
+        policy_dir, "configs", "robotx_aloha_agilex.json",
     )
 
-    # Build checkpoint path
+    # Checkpoint path (required, passed from eval.sh)
     ckpt_path = usr_args.get("ckpt_path", None)
     if ckpt_path is None:
-        task_name = usr_args["task_name"]
-        ckpt_setting = usr_args["ckpt_setting"]
-        checkpoint_num = usr_args.get("checkpoint_num", "latest")
-        ckpt_path = os.path.join(
-            policy_dir,
-            "checkpoints",
-            f"{task_name}-{ckpt_setting}",
-            f"{checkpoint_num}.ckpt",
-        )
+        raise ValueError("ckpt_path is required. Pass it via eval.sh or deploy_policy.yml")
 
-    action_stats_path = usr_args.get(
-        "action_stats_path",
-        os.path.join(os.path.dirname(ckpt_path), "action_stats.pt"),
+    # Action stats for denormalization (auto-detect from checkpoint directory)
+    action_stats_path = usr_args.get("action_stats_path") or os.path.join(
+        os.path.dirname(ckpt_path), "action_stats.pt",
     )
 
-    left_arm_dim = usr_args.get("left_arm_dim", 7)
-    right_arm_dim = usr_args.get("right_arm_dim", 7)
-    chunk_size = usr_args.get("audiox_chunk_size", 64)
+    left_arm_dim = usr_args.get("left_arm_dim", 6)
+    right_arm_dim = usr_args.get("right_arm_dim", 6)
+    chunk_size = usr_args.get("audiox_chunk_size", 50)
     cfg_scale = usr_args.get("cfg_scale", 3.0)
     num_steps = usr_args.get("num_steps", 50)
 
