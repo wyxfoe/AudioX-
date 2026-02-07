@@ -40,7 +40,7 @@
                     "type": "trajectory",
                     "config": {
                         "state_dim": 14,
-                        "mode": "direct"
+                        "mode": "mlp"
                     }
                 }
             ]
@@ -80,7 +80,7 @@
     "dataset": {
         "data_dir": "/home/wyx/Beijingwork/RoboTwin/data/beat_block_hammer/demo_clean_500",
         "task_description": "use the hammer to beat the block",
-        "camera_names": ["front_camera", "head_camera"],
+        "camera_names": ["front_camera", "head_camera", "left_camera", "right_camera"],
         "action_chunk_size": 50,
         "image_size": 224,
         "normalize": true,

@@ -175,3 +175,7 @@ saved_ckpt/
 wandb/
 demo_result/
 model/
+# Checkpoint files
+checkpoints/
+*.pt
+*.pth

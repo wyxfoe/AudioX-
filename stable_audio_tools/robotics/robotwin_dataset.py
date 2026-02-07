@@ -31,11 +31,9 @@ from .action_space import (
 
 # Aloha-AgileX 配置: 每臂6 DoF + 1 gripper = 14维
 ALOHA_AGILEX_CONFIG = ActionSpaceConfig(
-    left_arm_dim=6,
-    right_arm_dim=6,
-    left_gripper_dim=1,
-    right_gripper_dim=1,
-    use_ee_pose=False,
+    num_arms=2,           # 双臂
+    joints_per_arm=6,     # 每臂6个关节
+    gripper_dim=1,        # 每臂1个夹爪维度
 )
 
 

@@ -211,15 +211,27 @@ class RobotDiffusionTrainingWrapper(pl.LightningModule):
                 num_loss_buckets = 10
                 bucket_size = 1 / num_loss_buckets
                 loss_all = F.mse_loss(output, targets, reduction="none")
-                sigmas_flat = rearrange(
-                    self.all_gather(sigmas), "b c n -> (b) c n"
-                ).squeeze()
-                loss_all = rearrange(
-                    self.all_gather(loss_all), "b c n -> (b) c n"
-                )
+                
+                # Gather from all GPUs and handle dimensions correctly
+                sigmas_gathered = self.all_gather(sigmas)
+                loss_all_gathered = self.all_gather(loss_all)
+                
+                # all_gather may add a dimension: [world_size, batch, ...] or concatenate: [world_size*batch, ...]
+                # Handle both cases by flattening if 4D
+                if sigmas_gathered.ndim == 4:
+                    # Multi-GPU case: [world_size, batch, 1, 1] -> [world_size * batch, 1, 1]
+                    sigmas_gathered = sigmas_gathered.reshape(-1, *sigmas_gathered.shape[2:])
+                if loss_all_gathered.ndim == 4:
+                    # Multi-GPU case: [world_size, batch, action_dim, chunk_size] -> [world_size * batch, action_dim, chunk_size]
+                    loss_all_gathered = loss_all_gathered.reshape(-1, *loss_all_gathered.shape[2:])
+                
+                # Now rearrange: sigmas is [total_batch, 1, 1], loss_all is [total_batch, action_dim, chunk_size]
+                sigmas_flat = rearrange(sigmas_gathered, "b c n -> (b) c n").squeeze()
+                loss_all_flat = rearrange(loss_all_gathered, "b c n -> (b) c n")
+                
                 loss_all = torch.stack(
                     [
-                        loss_all[(sigmas_flat >= i) & (sigmas_flat < i + bucket_size)].mean()
+                        loss_all_flat[(sigmas_flat >= i) & (sigmas_flat < i + bucket_size)].mean()
                         for i in torch.arange(0, 1, bucket_size).to(self.device)
                     ]
                 )
@@ -440,7 +452,19 @@ class RobotDemoCallback(pl.Callback):
                     except ImportError:
                         pass
 
-            trainer.logger.experiment.log(log_dict)
+            # Log to appropriate logger
+            if hasattr(trainer.logger, 'experiment'):
+                if hasattr(trainer.logger.experiment, 'log'):
+                    # Wandb logger
+                    trainer.logger.experiment.log(log_dict)
+                elif hasattr(trainer.logger.experiment, 'add_scalar'):
+                    # TensorBoard logger
+                    for key, value in log_dict.items():
+                        if isinstance(value, (int, float)):
+                            trainer.logger.experiment.add_scalar(key, value, trainer.global_step)
+                        elif hasattr(value, 'image'):  # wandb.Image
+                            # Skip image logging for TensorBoard (would need different format)
+                            pass
 
         except Exception as e:
             print(f"Demo callback error: {type(e).__name__}: {e}")

@@ -5,13 +5,23 @@ Fine-tunes the AudioX-derived diffusion transformer for robot trajectory
 prediction using RoboTwin data.
 
 Usage:
-    # 训练 Aloha-AgileX 模型:
-    python train_robotx.py --config configs/robotx_aloha_agilex.json
-
-    # 指定数据目录和批次大小:
+    # 单GPU训练:
     python train_robotx.py --config configs/robotx_aloha_agilex.json \
                            --data_dir /path/to/data \
                            --batch_size 16
+
+    # 多GPU训练 (例如使用4张GPU):
+    python train_robotx.py --config configs/robotx_aloha_agilex.json \
+                           --data_dir /path/to/data \
+                           --batch_size 16 \
+                           --num_gpus 4
+
+    # 多节点多GPU训练:
+    python train_robotx.py --config configs/robotx_aloha_agilex.json \
+                           --data_dir /path/to/data \
+                           --batch_size 16 \
+                           --num_gpus 8 \
+                           --num_nodes 2
 
     # 从检查点恢复:
     python train_robotx.py --config configs/robotx_aloha_agilex.json \
@@ -51,14 +61,22 @@ def main():
                         help="Override data directory from config")
 
     # Training
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--num_gpus", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size per GPU (total batch = batch_size * num_gpus)")
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="Number of GPUs to use for training")
+    parser.add_argument("--num_nodes", type=int, default=1,
+                        help="Number of nodes for multi-node training")
+    parser.add_argument("--strategy", type=str, default="auto",
+                        help="Training strategy: auto, ddp, ddp_find_unused_parameters_true, fsdp")
     parser.add_argument("--precision", type=str, default="16-mixed",
                         help="Training precision: 16-mixed, bf16-mixed, 32")
     parser.add_argument("--max_steps", type=int, default=50000)
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
+                        help="Accumulate gradients over N batches")
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="Number of data loading workers per GPU")
     parser.add_argument("--seed", type=int, default=42)
 
     # Checkpointing
@@ -131,15 +149,27 @@ def main():
         raise ValueError("data_dir must be specified in config or via --data_dir")
 
     print(f"  Data directory: {data_dir}")
+    
+    # Calculate effective batch size
+    per_gpu_batch_size = dataset_config.get("batch_size", 16)
+    total_batch_size = per_gpu_batch_size * args.num_gpus * args.num_nodes
+    print(f"  Batch size per GPU: {per_gpu_batch_size}")
+    print(f"  Total batch size: {total_batch_size} (GPUs: {args.num_gpus}, Nodes: {args.num_nodes})")
+    
+    # Set num_workers per GPU (default: 4 per GPU)
+    num_workers_per_gpu = dataset_config.get("num_workers", 4)
+    if args.num_workers is not None:
+        num_workers_per_gpu = args.num_workers
+    print(f"  Data workers per GPU: {num_workers_per_gpu}")
 
     train_dataloader, train_dataset = create_robotwin_dataloader(
         data_dir=data_dir,
-        batch_size=dataset_config.get("batch_size", 16),
+        batch_size=per_gpu_batch_size,  # Per-GPU batch size
         action_chunk_size=config.get("action_chunk_size", 50),
         image_size=dataset_config.get("image_size", 224),
         camera_names=dataset_config.get("camera_names", ["front_camera", "head_camera"]),
         task_description=dataset_config.get("task_description", "complete the task"),
-        num_workers=dataset_config.get("num_workers", 4),
+        num_workers=num_workers_per_gpu,
         max_episodes=args.max_episodes,
         normalize=dataset_config.get("normalize", True),
         augment=dataset_config.get("augment", True),
@@ -191,10 +221,25 @@ def main():
 
     # Trainer
     print("\nInitializing trainer...")
+    
+    # Determine strategy for multi-GPU training
+    if args.num_gpus > 1 or args.num_nodes > 1:
+        if args.strategy == "auto":
+            # Use DDP for multi-GPU training
+            strategy = "ddp_find_unused_parameters_true"
+        else:
+            strategy = args.strategy
+        print(f"  Using {strategy} strategy for multi-GPU training")
+        print(f"  Devices: {args.num_gpus} GPUs per node, {args.num_nodes} nodes")
+    else:
+        strategy = "auto"
+        print(f"  Using single GPU training")
+    
     trainer = pl.Trainer(
-        devices=args.num_gpus,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        strategy="auto",
+        devices=args.num_gpus if args.num_gpus > 0 else "auto",
+        num_nodes=args.num_nodes,
+        accelerator="gpu" if torch.cuda.is_available() and args.num_gpus > 0 else "cpu",
+        strategy=strategy,
         precision=args.precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
@@ -202,8 +247,10 @@ def main():
         logger=logger,
         max_steps=args.max_steps,
         log_every_n_steps=10,
-        val_check_interval=args.save_every,
+        val_check_interval=None,  # Disable validation since we don't have val_dataloader
+        limit_val_batches=0,  # Explicitly disable validation
         enable_checkpointing=True,
+        sync_batchnorm=args.num_gpus > 1,  # Sync batch norm for multi-GPU
     )
 
     # Train
