@@ -6,7 +6,7 @@
         "diffusion": {
             "type": "dit",
             "diffusion_objective": "v",
-            "cross_attention_cond_ids": ["prompt", "proprio"],
+            "cross_attention_cond_ids": ["prompt", "video", "proprio"],
             "global_cond_ids": [],
             "input_concat_ids": [],
             "prepend_cond_ids": [],
@@ -32,6 +32,15 @@
                     "config": {
                         "t5_model_name": "t5-base",
                         "max_length": 64,
+                        "enable_grad": false
+                    }
+                },
+                {
+                    "id": "video",
+                    "type": "clip",
+                    "config": {
+                        "clip_model_name": "openai/clip-vit-base-patch32",
+                        "use_temporal_transformer": false,
                         "enable_grad": false
                     }
                 },
